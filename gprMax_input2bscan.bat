@@ -19,4 +19,3 @@ python -m gprMax %IN_FULLPATH%.in -n %NUM_ASCANS%
 python -m tools.outputfiles_merge %IN_FULLPATH% --remove-files
 
 ::python -m tools.plot_Bscan %IN_PATH%%IN_NAME%_merged.out Ez
-pause
