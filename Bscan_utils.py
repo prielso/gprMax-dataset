@@ -1,22 +1,12 @@
-import matplotlib.pyplot as plt
 import numpy as np
 from random import random as rd
 import h5py
 import re
 from scipy import ndimage
-from PIL import Image
 import subprocess
 from skimage.filters import gaussian
 import os
-import time
-
-# with open_gsf("D://GPR_local/new_recordings/Profile49.gsf") as gsf_file:
-#     # Note - file is closed automatically upon exiting 'with' block
-#     _, record = gsf_file.read(RecordType.GSF_RECORD_COMMENT)
-#
-#     # Note use of ctypes.string_at() to access POINTER(c_char) contents of
-#     # c_gsfComment.comment field.
-#     print(string_at(record.comment.comment))
+import json
 
 
 def get_rd3_data(path, file_name, num_samples):
@@ -235,14 +225,57 @@ def create_Bscan(input_fullpaths, num_traces, conda_path, batfile_path):
                          input_fullpaths[idx], str(number_of_ascans)], shell=True)
 
 
-def create_sim_file(path, file_name, dim, ground_height, res, time_window, frequency, txrx_step, height, obj_dim,
-                    obj_depth):
-    tx_frequency = frequency
-    txrx_start = [res * 10, ground_height + height, 0]
-    border = 10 * res  # the border of the domain which cannot be calculated
-
+def create_sim_file(path, file_name, simulation_dict):
+    """
+    This function creates the inputfile (.in) for the gprMax open source software (http://docs.gprmax.com/en/latest/include_readme.html)
+    to create the simulation, specifications need to be defined (e.g. the space size, the radar frequency and more).
+    :param path: The path for the .in file to be created.
+    :param file_name: The name of the .in file to created.
+    :param simulation_dict: A python dict object including the simulation details as detailed below:
+    1. 'domain' - [domain x size, domain y size, domain z size]. the simulation x,y,z size (e.g. [20, 15, 0.01]).
+                the z size is also the voxel resolution. the simulation is a 2D space.
+    2. 'time window' - is the time for every radar signal collection (seconds).
+    3. 'frequency' - is the centre frequency of the waveform (Hertz).
+    4. 'ground height' - is the height of the ground in the y dimension.
+    5. 'radar height' - is the height of the radar above the ground.
+    6. 'radar steps' - the distance between following A-scans.
+    7.  'objects' - is a list in which every element is a dict() of an object to be put in the simulation.
+        each object dict will contain the keys:
+        'type' - this key will contain the type of object.
+        'material' - the material of the objects "walls". inside it's just free space.
+        'depth' - the distance between the top part of the box and the ground.
+        'center x' - the lower left x coordinate of the box.
+        'walls thickness' - the objects walls thickness with the chosen material, inside is free-space.
+                            if equal to 'None' no free-space will be put inside the object.
+        There are different types of objects, each include it specific keys:
+        7.1 Box - type key will contain the string 'box':
+            'width' - the x size of the box.
+            'height' - the y size of the box.
+            'corner radius' - the box corners can be rounded by making this larger than 0.
+        7.2 Cylinder - type key will contain the string 'cylinder':
+            'radius' - the radius of the cylinder.
+    8. 'random seed' - an integer number for seeding the randomness of the ground surface, material and grass(if present).
+    ** note: all the dictionaries have to filled with all the needed details above. **
+    """
     new_path = path + file_name + '_files/'
     os.makedirs(new_path, exist_ok=True)
+
+    ## saving a json file with all the scene details:
+    with open(new_path + file_name + '.json', "w") as write_file:
+        json.dump(simulation_dict, write_file, indent=4)
+
+    seed = simulation_dict.get('random seed')
+    dim = simulation_dict.get('domain')
+    tx_frequency = simulation_dict.get('frequency')
+    time_window = simulation_dict.get('time window')
+    ground_height = simulation_dict.get('ground height')
+    height = simulation_dict.get('radar height')
+    txrx_step = simulation_dict.get('radar steps')
+    res = dim[2]
+    txrx_start = [res * 12, ground_height + height, 0]
+    border = 10 * res  # the border of the domain which cannot be calculated
+    distance_rx2tx = 2 * res
+
     file = open(new_path + file_name + '.in', "w")
     file.write("#title: simulation scene for B-scan\n")
     file.write("#domain: {} {} {}\n".format(dim[0], dim[1], res))
@@ -257,78 +290,161 @@ def create_sim_file(path, file_name, dim, ground_height, res, time_window, frequ
     ## TX/RX properties:
     file.write("\n#waveform: ricker 1 {} signal\n".format(tx_frequency))
     file.write("#hertzian_dipole: z {} {} {} signal\n".format(txrx_start[0], txrx_start[1], txrx_start[2], ".2f"))
-    file.write("#rx: {} {} {}\n".format(txrx_start[0] + res * 2, txrx_start[1], txrx_start[2]))
+    file.write("#rx: {} {} {}\n".format(txrx_start[0] + distance_rx2tx, txrx_start[1], txrx_start[2]))
     file.write("#src_steps: {} 0 0\n".format(txrx_step))
     file.write("#rx_steps: {} 0 0\n".format(txrx_step))
 
     ## Creating the Scene: used to build geometric shapes with different constitutive parameters
-    file.write("\n#fractal_box: 0 0 0 {} {} {} 2 1.5 0.3 1 50 my_soil ground 1\n".format(dim[0], ground_height, res))
-    file.write("#add_surface_roughness: 0 {} 0 {} {} {} 1.5 0.5 0.5 {} {} ground 1\n".format(ground_height, dim[0],
-                                                                                             ground_height, res,
-                                                                                             ground_height * 0.98,
-                                                                                             ground_height))
-    file.write("#add_grass: 0 {} 0 {} {} {} 0.5 {} {} 100 ground 1\n".format(ground_height, dim[0], ground_height, res,
-                                                                             ground_height * 1.1,
-                                                                             ground_height * 1.15))
-
+    file.write(
+        "\n#fractal_box: 0 0 0 {} {} {} 2 1.5 0.3 1 50 my_soil ground {}\n".format(dim[0], ground_height, res, seed))
+    file.write("#add_surface_roughness: 0 {} 0 {} {} {} 1.5 0.5 0.5 {} {} ground {}\n".format(ground_height, dim[0],
+                                                                                              ground_height, res,
+                                                                                              ground_height * 0.96,
+                                                                                              ground_height, seed))
+    file.write(
+        "##add_grass: 0 {} 0 {} {} {} 0.5 {} {} 100 ground {}\n".format(ground_height, dim[0], ground_height, res,
+                                                                        ground_height * 1.1,
+                                                                        ground_height * 1.15, seed))
     # adding objects to the scene:
-    for obj_i in range(len(obj_dim)):
-        lower_left_x = (dim[0] - obj_dim[obj_i][0] - 2 * border) * round(rd(), 3) + border
-        lower_left_y = (ground_height - obj_dim[obj_i][1] - obj_depth[obj_i])
-        insert_obj(file, domain_dim=dim, obj_dim=obj_dim[obj_i],
-                   lower_left=[lower_left_x, lower_left_y], res=res)
+    insert_obj(file, simulation_dict)
+
     file.write("\n##geometry_view: 0 0 0 {} {} {} {} {} {} {} n".format(dim[0], dim[1], res, res, res, res,
-                                                                          file_name + '_geo'))
+                                                                        file_name + '_geo'))
     file.close()
 
 
-def insert_obj(file, domain_dim, obj_dim, lower_left, res):
-    # creating a square object with rounded corners
-    lower_left_x = lower_left[0]
-    lower_left_y = lower_left[1]
-    corner_radius = obj_dim[2]
-    obj_walls_wdth = obj_dim[3]
-    material = obj_dim[4]
-    if corner_radius <= 0:
-        file.write("#box: {} {} 0 {} {} {} {}\n".format(lower_left_x + obj_dim[3], lower_left_y + obj_dim[3],
-                                                        lower_left_x + obj_dim[0] - obj_dim[3],
-                                                        lower_left_y + obj_dim[1] - obj_dim[3],
-                                                        res, material))
+def insert_obj(file, simulation_dict):
+    """
+    (see function create_sim_file)
+    This function is writing text in the given file object that will add objects to the simulation scene.
+    the objects & scene details will be read from a given python dict.
+    :param file: an open file object that is been writen currently by the 'create_sim_file' function
+    :param simulation_dict: A python dict object including the simulation details as detailed below:
+    1.  'domain' - [domain x size, domain y size, domain z size]. the simulation x,y,z size (e.g. [20, 15, 0.01]).
+                the z size is also the voxel resolution. the simulation is a 2D space.
+    2.  'time window' - is the time for every radar signal collection (seconds).
+    3.  'frequency' - is the centre frequency of the waveform (Hertz).
+    4.  'ground height' - is the height of the ground in the y dimension.
+    5.  'radar height' - is the height of the radar above the ground.
+    6.  'radar steps' - the distance between following A-scans.
+    7.  'objects' - is a list in which every element is a dict() of an object to be put in the simulation.
+        each object dict will contain the keys:
+        'type' - this key will contain the type of object.
+        'material' - the material of the objects "walls". inside it's just free space.
+        'depth' - the distance between the top part of the box and the ground.
+        'center x' - the lower left x coordinate of the box.
+        'walls thickness' - the objects walls thickness with the chosen material, inside is free-space.
+                            if equal to 'None' no free-space will be put inside the object.
+        There are different types of objects, each include it specific keys:
+        7.1 Box - type key will contain the string 'box':
+            'width' - the x size of the box.
+            'height' - the y size of the box.
+            'corner radius' - the box corners can be rounded by making this larger than 0.
+        7.2 Cylinder - type key will contain the string 'cylinder':
+            'radius' - the radius of the cylinder.
+    8. 'random seed' - an integer number for seeding the randomness of ground surface, material and grass(if present).
+    ** note: all the dictionaries have to filled with all the needed details above. **
+    """
+    objects_list = simulation_dict.get('objects')
+    if objects_list is None:
         return
-
-    file.write("\n## square hollow object with rounded corners:\n")
-    file.write("#box: {} {} 0 {} {} {} {}\n".format(lower_left_x, lower_left_y + corner_radius,
-                                                    lower_left_x + obj_dim[0],
-                                                    lower_left_y + obj_dim[1] - corner_radius,
-                                                    res, material))
-    file.write("#box: {} {} 0 {} {} {} {}\n".format(lower_left_x + corner_radius, lower_left_y,
-                                                    lower_left_x + obj_dim[0] - corner_radius,
-                                                    lower_left_y + obj_dim[1],
-                                                    res, material))
-    # create the rounded corners:
-    file.write("#cylinder: {} {} 0 {} {} {} {} {}\n".format(lower_left_x + corner_radius, lower_left_y + corner_radius,
-                                                            lower_left_x + corner_radius, lower_left_y + corner_radius,
-                                                            res, corner_radius, material))
-    file.write("#cylinder: {} {} 0 {} {} {} {} {}\n".format(lower_left_x - corner_radius + obj_dim[0],
-                                                            lower_left_y + corner_radius,
-                                                            lower_left_x - corner_radius + obj_dim[0],
-                                                            lower_left_y + corner_radius,
-                                                            res, corner_radius, material))
-    file.write("#cylinder: {} {} 0 {} {} {} {} {}\n".format(lower_left_x + corner_radius,
-                                                            lower_left_y - corner_radius + obj_dim[1],
-                                                            lower_left_x + corner_radius,
-                                                            lower_left_y - corner_radius + obj_dim[1],
-                                                            res, corner_radius, material))
-    file.write("#cylinder: {} {} 0 {} {} {} {} {}\n".format(lower_left_x - corner_radius + obj_dim[0],
-                                                            lower_left_y - corner_radius + obj_dim[1],
-                                                            lower_left_x - corner_radius + obj_dim[0],
-                                                            lower_left_y - corner_radius + obj_dim[1],
-                                                            res, corner_radius, material))
-    if material == 'free_space':
-        return
-    insert_obj(file, domain_dim,
-               [obj_dim[0] - 2 * obj_dim[3], obj_dim[1] - 2 * obj_dim[3], obj_dim[2] - obj_dim[3], 0, 'free_space'],
-               [lower_left_x + obj_dim[3], lower_left_y + obj_dim[3]], res)
-
-
-
+    res = simulation_dict['domain'][2]
+    ground_height = simulation_dict['ground height']
+    # inserting the objects in the list:
+    for object_dict in objects_list:
+        material = object_dict['material']
+        depth = object_dict['depth']
+        center_x = object_dict['center x']
+        walls_wdth = object_dict['walls thickness']
+        if object_dict['type'] == 'box':
+            # creating a box shaped object with rounded corners
+            height = object_dict['height']
+            width = object_dict['width']
+            lower_left_x = center_x - np.float16(width / 2)
+            lower_left_y = ground_height - depth - height
+            corner_radius = object_dict['corner radius']
+            if corner_radius > np.float16((height - 2 * walls_wdth) / 2) or corner_radius > np.float16(
+                    (width - 2 * walls_wdth) / 2):
+                print("\n*** Corners Radius is too big! ***\n")
+                continue
+            if corner_radius == 0:
+                file.write("\n## box shape hollow object with rounded corners:\n")
+                file.write(
+                    f"#box: {lower_left_x} {lower_left_y} 0 {lower_left_x + width} {lower_left_y + height} {res} {material}\n")
+                if min(height, width) <= 2 * walls_wdth:
+                    continue
+                file.write(f"#box: {lower_left_x + walls_wdth} {lower_left_y + walls_wdth} 0 "
+                           f"{lower_left_x + width - walls_wdth} {lower_left_y + height - walls_wdth} {res} {'free_space'}\n")
+            else:
+                file.write("\n## box shape hollow object with rounded corners:\n")
+                file.write(f"#box: {lower_left_x} {lower_left_y + corner_radius} 0 "
+                           f"{lower_left_x + width} {lower_left_y + height - corner_radius} {res} {material}\n")
+                file.write(f"#box: {lower_left_x + corner_radius} {lower_left_y} 0 "
+                           f"{lower_left_x + width - corner_radius} {lower_left_y + height} {res} {material}\n")
+                # create the rounded corners:
+                file.write("#cylinder: {} {} 0 {} {} {} {} {}\n".format(lower_left_x + corner_radius,
+                                                                        lower_left_y + corner_radius,
+                                                                        lower_left_x + corner_radius,
+                                                                        lower_left_y + corner_radius,
+                                                                        res, corner_radius, material))
+                file.write("#cylinder: {} {} 0 {} {} {} {} {}\n".format(lower_left_x - corner_radius + width,
+                                                                        lower_left_y + corner_radius,
+                                                                        lower_left_x - corner_radius + width,
+                                                                        lower_left_y + corner_radius,
+                                                                        res, corner_radius, material))
+                file.write("#cylinder: {} {} 0 {} {} {} {} {}\n".format(lower_left_x + corner_radius,
+                                                                        lower_left_y - corner_radius + height,
+                                                                        lower_left_x + corner_radius,
+                                                                        lower_left_y - corner_radius + height,
+                                                                        res, corner_radius, material))
+                file.write("#cylinder: {} {} 0 {} {} {} {} {}\n".format(lower_left_x - corner_radius + width,
+                                                                        lower_left_y - corner_radius + height,
+                                                                        lower_left_x - corner_radius + width,
+                                                                        lower_left_y - corner_radius + height,
+                                                                        res, corner_radius, material))
+                if min(height, width) <= 2 * walls_wdth:
+                    continue
+                ## creating the free-space inside the box:
+                file.write("\n## the box's free space:\n")
+                file.write(f"#box: {lower_left_x + walls_wdth} {lower_left_y + corner_radius + walls_wdth} 0 "
+                           f"{lower_left_x + width - walls_wdth} {lower_left_y + height - corner_radius - walls_wdth} "
+                           f"{res} {'free_space'}\n")
+                file.write(f"#box: {lower_left_x + corner_radius + walls_wdth} {lower_left_y + walls_wdth} 0 "
+                           f"{lower_left_x + width - corner_radius - walls_wdth} {lower_left_y + height - walls_wdth} "
+                           f"{res} {'free_space'}\n")
+                # create the rounded corners:
+                file.write("#cylinder: {} {} 0 {} {} {} {} {}\n".format(lower_left_x + corner_radius + walls_wdth,
+                                                                        lower_left_y + corner_radius + walls_wdth,
+                                                                        lower_left_x + corner_radius + walls_wdth,
+                                                                        lower_left_y + corner_radius + walls_wdth,
+                                                                        res, corner_radius, 'free_space'))
+                file.write(
+                    "#cylinder: {} {} 0 {} {} {} {} {}\n".format(lower_left_x - corner_radius + width - walls_wdth,
+                                                                 lower_left_y + corner_radius + walls_wdth,
+                                                                 lower_left_x - corner_radius + width - walls_wdth,
+                                                                 lower_left_y + corner_radius + walls_wdth,
+                                                                 res, corner_radius, 'free_space'))
+                file.write("#cylinder: {} {} 0 {} {} {} {} {}\n".format(lower_left_x + corner_radius + walls_wdth,
+                                                                        lower_left_y - corner_radius + height - walls_wdth,
+                                                                        lower_left_x + corner_radius + walls_wdth,
+                                                                        lower_left_y - corner_radius + height - walls_wdth,
+                                                                        res, corner_radius, 'free_space'))
+                file.write(
+                    "#cylinder: {} {} 0 {} {} {} {} {}\n".format(lower_left_x - corner_radius + width - walls_wdth,
+                                                                 lower_left_y - corner_radius + height - walls_wdth,
+                                                                 lower_left_x - corner_radius + width - walls_wdth,
+                                                                 lower_left_y - corner_radius + height - walls_wdth,
+                                                                 res, corner_radius, 'free_space'))
+        if object_dict['type'] == 'cylinder':
+            # creating a box shaped object with rounded corners
+            radius = object_dict['radius']
+            center_x = object_dict['center x']
+            center_y = ground_height - depth - radius
+            if radius - walls_wdth <= 0:
+                file.write("\n##add cylinder object to the scene:\n")
+                file.write(f"#cylinder: {center_x} {center_y} 0 {center_x} {center_y} {res} {radius} {material}\n")
+            else:
+                file.write("\n##add cylinder object to the scene:\n")
+                file.write(f"#cylinder: {center_x} {center_y} 0 {center_x} {center_y} {res} {radius} {material}\n")
+                file.write(
+                    f"#cylinder: {center_x} {center_y} 0 {center_x} {center_y} {res} {radius - walls_wdth} {'free_space'}\n")
